@@ -1,0 +1,65 @@
+flowchart TD
+  Start["handler(c) L223"] --> Req["Parse request directives<br/>no-store / no-cache / only-if-cached<br/>L224-L237"]
+  Req --> Method{"method cacheable?<br/>L239-L245"}
+  Method -- no --> Bypass["X-Cache=unreachable<br/>return c.Next()"]
+  Method -- yes --> Key["build baseKey / manifestKey<br/>load Vary manifest<br/>manager.get(key)<br/>L247-L276"]
+
+  Key --> Init["entryAge=0<br/>revalidate=false<br/>oldHeapIdx=-1<br/>L277-L294"]
+  Init --> Lock["mux.Lock()<br/>ts := safeUnixSeconds(time.Now())<br/>locked := true<br/>unlock := guarded mux.Unlock<br/>relock := guarded mux.Lock<br/>L296-L312"]
+
+  Lock --> HasEntry{"e != nil?"}
+
+  HasEntry -- yes --> Freshness["Under lock:<br/>entryAge = cachedResponseAge(e, ts)<br/>request max-age/min-fresh may set:<br/>revalidate=true, oldHeapIdx=e.heapidx, e=nil<br/>L313-L335"]
+  HasEntry -- no --> NilReval{"e == nil && revalidate?<br/>L513"}
+
+  Freshness --> ZeroTTLExpired{"ttl==0 && exp!=0 && ts>=exp?<br/>L337"}
+  ZeroTTLExpired -- yes --> ExpiredDelete["unlock()<br/>deleteKey(reqCtx,key) I/O outside lock<br/>relock()<br/>removeHeapEntry(key,e.heapidx)<br/>release if external storage<br/>e=nil<br/>unlock()<br/>X-Cache=unreachable<br/>goto continueRequest<br/>L338-L353"]
+  ZeroTTLExpired -- no --> EntryBranch["Evaluate private, invalidator, expiration,<br/>staleness, must-revalidate, min-fresh<br/>L356-L388"]
+
+  EntryBranch --> Revalidate{"revalidate?<br/>L389"}
+  Revalidate -- yes --> GotoReval["unlock()<br/>X-Cache=unreachable<br/>only-if-cached => 504<br/>goto continueRequest<br/>L390-L395"]
+
+  Revalidate -- no --> Switch{"switch entry state<br/>L400"}
+
+  Switch -- "expired && !allowStale" --> DeleteExpired["unlock()<br/>deleteKey I/O outside lock<br/>relock()<br/>idx := e.heapidx<br/>manager.release(e)<br/>removeHeapEntry(key, idx)<br/>e=nil<br/>L401-L413"]
+  DeleteExpired --> NilReval
+
+  Switch -- "entryHasPrivate" --> DeletePrivate["unlock()<br/>deleteKey I/O outside lock<br/>relock()<br/>removeHeapEntry(key,e.heapidx)<br/>release if external storage<br/>e=nil<br/>unlock()<br/>X-Cache=unreachable<br/>return c.Next()<br/>L414-L433"]
+
+  Switch -- "entryHasExpiration && !requestNoCache" --> ServeCached["If auth && !shareable:<br/>release, unlock, return c.Next()<br/><br/>If external storage:<br/>unlock(); manager.getRaw(key+'_body')<br/>Else: unlock()<br/><br/>Replay body/status/headers<br/>Age + Warning headers<br/>X-Cache=hit<br/>release if external storage<br/>return nil<br/>L434-L507"]
+
+  Switch -- default --> NilReval
+
+  NilReval -- yes --> GotoNilReval["unlock()<br/>X-Cache=unreachable<br/>only-if-cached => 504<br/>goto continueRequest<br/>L513-L519"]
+  NilReval -- no --> OnlyIfCached{"e == nil && only-if-cached?<br/>L522"}
+  OnlyIfCached -- yes --> Timeout["unlock()<br/>X-Cache=unreachable<br/>return 504<br/>L523-L525"]
+  OnlyIfCached -- no --> NormalMiss["unlock()<br/>fall through to continueRequest<br/>L528-L531"]
+
+  ExpiredDelete --> Continue
+  GotoReval --> Continue
+  GotoNilReval --> Continue
+  NormalMiss --> Continue
+
+  Continue["continueRequest label<br/>c.Next()<br/>L531-L535"] --> RespRules["Parse response Cache-Control / Vary<br/>L537-L542"]
+
+  RespRules --> Uncacheable{"no-store/private/no-cache/Vary:*<br/>or auth not shareable<br/>or bad status<br/>or cfg.Next<br/>or body > MaxBytes?<br/>L544-L615"}
+  Uncacheable -- yes --> CleanupOld["May delete existing e and heap entry:<br/>deleteKey outside lock<br/>mux.Lock(); removeHeapEntry(); release; mux.Unlock()<br/>X-Cache=unreachable<br/>return nil<br/>L552-L576"]
+  Uncacheable -- no --> Reserve{"cfg.MaxBytes > 0?<br/>L623-L633"}
+
+  Reserve -- yes --> ReserveLock["mux.Lock()<br/>storedBytes += bodySize<br/>spaceReserved=true<br/>while storedBytes > MaxBytes:<br/>heap.removeFirst(); storedBytes -= size<br/>collect keysToRemove/candidates<br/>mux.Unlock()<br/>L633-L664"]
+  ReserveLock --> EvictIO["deleteKey(evictedKey) outside lock<br/>L666-L672"]
+  EvictIO --> EvictFail{"delete failed?<br/>L669-L704"}
+  EvictFail -- yes --> Restore["mux.Lock()<br/>restore storedBytes<br/>unreserve bodySize<br/>heap.put(restored candidates)<br/>mux.Unlock()<br/>refreshHeapIndex() writes heapidx back to storage<br/>return error<br/>L674-L704"]
+  EvictFail -- no --> BuildEntry
+
+  Reserve -- no --> BuildEntry["manager.acquire()<br/>copy response body/status/headers<br/>compute expiration, exp, ttl, flags<br/>L709-L839"]
+
+  BuildEntry --> HeapPut{"cfg.MaxBytes > 0?<br/>L843"}
+  HeapPut -- yes --> PutLock["mux.Lock()<br/>heapIdx = heap.put(key,e.exp,bodySize)<br/>e.heapidx = heapIdx<br/>spaceReserved=false<br/>mux.Unlock()<br/>L843-L850"]
+  HeapPut -- no --> Store
+  PutLock --> Store["Store entry:<br/>external storage => setRaw(key+'_body'), e.body=nil, set(key,e)<br/>memory => set(key,e)<br/>on error cleanupOnStoreError locks heap removal<br/>L853-L897"]
+
+  Store --> RevalOld{"revalidate && oldHeapIdx >= 0 && MaxBytes > 0?<br/>L899"}
+  RevalOld -- yes --> RemoveOld["mux.Lock()<br/>removeHeapEntry(key, oldHeapIdx)<br/>mux.Unlock()<br/>L900-L903"]
+  RevalOld -- no --> Miss
+  RemoveOld --> Miss["X-Cache=miss<br/>return nil<br/>L906-L909"]
